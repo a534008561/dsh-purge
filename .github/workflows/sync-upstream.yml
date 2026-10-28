@@ -1,0 +1,66 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '33 1 * * *'   # 每天北京时间 09:33
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '硬同步: 放弃与上游的差异, 强制重置为上游状态'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: YuJunZhiXue/dsh-purge
+  BRANCH: master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: API 同步上游 (fast-forward 或 merge)
+        id: merge
+        continue-on-error: true
+        run: |
+          resp=$(curl -s -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/merge-upstream" \
+            -d '{{"branch":"$BRANCH"}}')
+          code=$(echo "$resp" | tail -1); body=$(echo "$resp" | head -n -1)
+          echo "$body"
+          if [ "$code" = "200" ] || [ "$code" = "202" ]; then
+            echo "synced=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "synced=fail" >> "$GITHUB_OUTPUT"
+            echo "::warning::merge-upstream 返回 $code (409=有冲突/分叉, 需硬同步)"
+          fi
+
+      - name: 硬同步 (仅手动选择 force=true 时)
+        if: steps.merge.outcome == 'failure' && inputs.force == 'true'
+        run: |
+          git clone --depth 1 --branch "$BRANCH" \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$GITHUB_REPOSITORY.git" work
+          cd work
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream "$BRANCH" --depth 1
+          git checkout "$BRANCH"
+          git reset --hard "upstream/$BRANCH"
+          git push origin "$BRANCH" --force
+          echo "已硬重置 $BRANCH 为 $UPSTREAM@$BRANCH"
+
+      - name: 结果
+        if: always()
+        run: |
+          if [ "${{ steps.merge.outcome }}" = "success" ]; then
+            echo "✅ 同步完成: $UPSTREAM -> $GITHUB_REPOSITORY"
+          elif [ "${{ inputs.force }}" = "true" ]; then
+            echo "✅ 硬同步完成"
+          else
+            echo "⚠️ 自动合并失败。与上游有冲突或分叉。可手动运行本工作流并选 force=true 做硬同步"
+            exit 1
+          fi
